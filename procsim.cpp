@@ -4,6 +4,7 @@
 #include <cstring>
 #include <list>
 #include <vector>
+#include <stdlib.h>
 
 #include "procsim.hpp"
 
@@ -13,29 +14,46 @@
 // TODO: Define any useful data structures and functions here
 //
 // qentry_t is used for all queue data structures
-// the dispatch queue and ROB are linked lists.
-// The scheduling queue reservation stations are implemented
-// as fixed size arrays.
 typedef struct queue_entry {
-    inst_t *inst;
+    const inst_t *inst;
+    unsigned long src1_preg;
+    unsigned long src2_preg;
+    unsigned long dest_preg;
+    unsigned long prev_preg;
     bool completed;
-    struct queue_entry *next;
+    struct queue_entry *disp_next;
+    struct queue_entry *sched_prev;
+    struct queue_entry *sched_next;
+    struct queue_entry *rob_next;
 } qentry_t;
-qentry_t *dispatch_head;
-qentry_t *dispatch_tail;
-qentry_t *ALU_RS;
-qentry_t *MUL_RS;
-qentry_t *LS_RS;
-qentry_t *ROB;
+qentry_t *dispatch_head = NULL;
+qentry_t *dispatch_tail = NULL;
+qentry_t *ROB_head = NULL;
+qentry_t *ROB_tail = NULL;
+qentry_t *ALU_RS_head = NULL;
+qentry_t *ALU_RS_tail = NULL;
+qentry_t *MUL_RS_head = NULL;
+qentry_t *MUL_RS_tail = NULL;
+qentry_t *LS_RS_head = NULL;
+qentry_t *LS_RS_tail = NULL;
 
 typedef struct reg {
     bool free;
     bool ready;
 } reg_t;
 
-struct int32_t RAT[32];
+unsigned long RAT[32];
 struct reg *reg_file;
 size_t FETCH_WIDTH;
+size_t NUM_PREGS;
+size_t NUM_ROB_ENTRIES;
+size_t MAX_ROB_ENTRIES;
+size_t NUM_ALU_RS_ENTRIES;
+size_t MAX_ALU_RS_ENTRIES;
+size_t NUM_MUL_RS_ENTRIES;
+size_t MAX_MUL_RS_ENTRIES;
+size_t NUM_LS_RS_ENTRIES;
+size_t MAX_LS_RS_ENTRIES;
 
 // The helper functions in this#ifdef are optional and included here for your
 // convenience so you can spend more time writing your simulator logic and less
@@ -97,13 +115,13 @@ static void print_prf(void) {
 static void print_rob(void) {
     size_t printed_idx = 0;
     printf("\tAllocated Entries in ROB: %lu\n", 0ul); // TODO: Fix Me
-    for (qentry_t *entry = ROB; entry != NULL; entry = entry->next) { // TODO: Fix Me
+    for (qentry_t *entry = ROB_head; entry != NULL; entry = entry->rob_next) { // TODO: Fix Me
         if (printed_idx == 0) {
-            printf("    { dyncount=%05" PRIu64 ", completed: %d, mispredict: %d }", entry->inst.dyn_instruction_count, entry->inst.completed, entry->inst.mispredict); // TODO: Fix Me
+            printf("    { dyncount=%05" PRIu64 ", completed: %d, mispredict: %d }", entry->inst->dyn_instruction_count, entry->completed, entry->inst->mispredict); // TODO: Fix Me
         } else if (!(printed_idx & 0x3)) {
-            printf("\n    { dyncount=%05" PRIu64 ", completed: %d, mispredict: %d }", entry->inst.dyn_instruction_count, entry->inst.completed, entry->inst.mispredict); // TODO: Fix Me
+            printf("\n    { dyncount=%05" PRIu64 ", completed: %d, mispredict: %d }", entry->inst->dyn_instruction_count, entry->completed, entry->inst->mispredict); // TODO: Fix Me
         } else {
-            printf(", { dyncount=%05" PRIu64 " completed: %d, mispredict: %d }", entry->inst.dyn_instruction_count, entry->inst.completed, entry->inst.mispredict);
+            printf(", { dyncount=%05" PRIu64 " completed: %d, mispredict: %d }", entry->inst->dyn_instruction_count, entry->completed, entry->inst->mispredict);
         }
         printed_idx++;
     }
@@ -197,6 +215,82 @@ static void stage_schedule(procsim_stats_t *stats) {
 // The PDF has details.
 static void stage_dispatch(procsim_stats_t *stats) {
     // TODO: fill me in
+    // Find the first empty entry in the ROB
+    while (1) {
+        qentry_t *entry = dispatch_head;
+        if (entry == NULL) {
+            return;
+        }
+        const inst_t *inst = entry->inst;
+
+        if (NUM_ROB_ENTRIES >= MAX_ROB_ENTRIES) {
+            return;
+        }
+
+        unsigned long dest_preg = -1;
+        if (inst->dest >= 0) {
+            for (unsigned long i = 32; i < 32 + NUM_PREGS; i++) {
+                if (reg_file[i].free) {
+                    dest_preg = i;
+                    break;
+                }
+            }
+            return;  // No free pregs
+        }
+
+        // From here down are changes to the state of the system //
+
+        switch(inst->opcode) {
+            case OPCODE_ADD:
+                if (NUM_ALU_RS_ENTRIES >= MAX_ALU_RS_ENTRIES) return;
+                if (ALU_RS_head == NULL) ALU_RS_head = entry;
+                if (ALU_RS_tail != NULL) ALU_RS_tail->sched_next = entry;
+                entry->sched_prev = ALU_RS_tail;
+                ALU_RS_tail = entry;
+                NUM_ALU_RS_ENTRIES++;
+                break;
+            case OPCODE_MUL:
+                if (NUM_MUL_RS_ENTRIES >= MAX_MUL_RS_ENTRIES) return;
+                if (MUL_RS_head == NULL) MUL_RS_head = entry;
+                if (MUL_RS_tail != NULL) MUL_RS_tail->sched_next = entry;
+                entry->sched_prev = MUL_RS_tail;
+                MUL_RS_tail = entry;
+                NUM_MUL_RS_ENTRIES++;
+                break;
+            case OPCODE_LOAD:
+            case OPCODE_STORE:
+                if (NUM_LS_RS_ENTRIES >= MAX_LS_RS_ENTRIES) return;
+                if (LS_RS_head == NULL) LS_RS_head = entry;
+                if (LS_RS_tail != NULL) LS_RS_tail->sched_next = entry;
+                entry->sched_prev = LS_RS_tail;
+                LS_RS_tail = entry;
+                NUM_LS_RS_ENTRIES++;
+                break;
+            case OPCODE_BRANCH:
+                ////??????
+                break;
+            default:
+                break;
+        }
+
+        if (inst->src1 >= 0) entry->src1_preg = RAT[inst->src1];
+        if (inst->src2 >= 0) entry->src2_preg = RAT[inst->src2];
+        if (inst->dest >= 0) {
+            entry->prev_preg = RAT[inst->dest];  // Save previous preg
+            RAT[inst->dest] = dest_preg;
+        }
+
+        // Place in the ROB
+        if (ROB_tail != NULL) {
+            ROB_tail->rob_next = entry;
+        }
+        if (ROB_head == NULL) ROB_head = entry;
+        ROB_tail = entry;
+        NUM_ROB_ENTRIES++;
+        // Remove from dispatch head
+        dispatch_head = entry->disp_next;
+    }
+
 #ifdef DEBUG
     printf("Stage Dispatch: \n"); //  PROVIDED
 #endif
@@ -208,12 +302,21 @@ static void stage_dispatch(procsim_stats_t *stats) {
 // project, the dispatch queue is infinite in size.
 static void stage_fetch(procsim_stats_t *stats) {
     // Fetch instructions and add them to the dispatch queue
-    for (int i = 0; i < FETCH_WIDTH; i++) {
-        inst_t inst = procsim_driver_read_inst();
-        qentry_t entry;
+    for (size_t i = 0; i < FETCH_WIDTH; i++) {
+        const inst_t *inst = procsim_driver_read_inst();
+        if (inst == NULL) return;
+        qentry_t *entry = (qentry_t *)malloc(sizeof(qentry_t));
         entry->inst = inst;
-        entry->next = NULL;
-        dispatch_tail->next = entry;
+        entry->disp_next = NULL;
+        entry->sched_next = NULL;
+        entry->rob_next = NULL;
+        entry->completed = false;
+        if (dispatch_tail != NULL) {
+            dispatch_tail->disp_next = entry;
+        }
+        if (dispatch_head == NULL) {
+            dispatch_head = entry;  // The queue was empty
+        }
         dispatch_tail = entry;
     }
 #ifdef DEBUG
@@ -225,10 +328,19 @@ static void stage_fetch(procsim_stats_t *stats) {
 // state, and statistics.
 void procsim_init(const procsim_conf_t *sim_conf, procsim_stats_t *stats) {
     FETCH_WIDTH = sim_conf->fetch_width;
+    NUM_PREGS = sim_conf->num_pregs;
+    NUM_ROB_ENTRIES = 0;
+    MAX_ROB_ENTRIES = 32 + NUM_PREGS;
+    NUM_ALU_RS_ENTRIES = 0;
+    MAX_ALU_RS_ENTRIES = sim_conf->num_alu_fus * sim_conf->num_schedq_entries_per_fu;
+    NUM_MUL_RS_ENTRIES = 0;
+    MAX_MUL_RS_ENTRIES = sim_conf->num_mul_fus * sim_conf->num_schedq_entries_per_fu;
+    NUM_LS_RS_ENTRIES = 0;
+    MAX_LS_RS_ENTRIES = sim_conf->num_lsu_fus * sim_conf->num_schedq_entries_per_fu;
 
     // Initialize the register file
     reg_file = (reg_t *)malloc(sizeof(reg_t) * (32 + sim_conf->num_pregs));
-    for (int i = 0; i < 32 + sim_conf->num_pregs; i++) {
+    for (uint32_t i = 0; i < 32 + sim_conf->num_pregs; i++) {
         reg_file[i].free = 1;
         reg_file[i].ready = 1;
     }
@@ -236,14 +348,17 @@ void procsim_init(const procsim_conf_t *sim_conf, procsim_stats_t *stats) {
     for (int i = 0; i < 32; i++) {
         RAT[i] = i;
     }
-    // Initialize reservation stations
-    ALU_RS = (qentry_t*)malloc(sizeof(qentry_t) * sim_conf->num_schedq_entries_per_fu);
-    MUL_RS = (qentry_t*)malloc(sizeof(qentry_t) * sim_conf->num_schedq_entries_per_fu);
-    LS_RS = (qentry_t*)malloc(sizeof(qentry_t) * sim_conf->num_schedq_entries_per_fu);
-
+//     // Initialize reservation stations
+//     ALU_RS = (qentry_t*)malloc(sizeof(qentry_t) *
+//             sim_conf->num_schedq_entries_per_fu * sim_conf->num_alu_fus);
+//     MUL_RS = (qentry_t*)malloc(sizeof(qentry_t) *
+//             sim_conf->num_schedq_entries_per_fu * sim_conf->num_mul_fus);
+//     LS_RS = (qentry_t*)malloc(sizeof(qentry_t) *
+//             sim_conf->num_schedq_entries_per_fu * sim_conf->num_lsu_fus);
 
 #ifdef DEBUG
-    printf("\nScheduling queue capacity: %lu instructions\n", 0ul); // TODO: Fix ME
+    printf("\nScheduling queue capacity: %lu instructions\n", sim_conf->num_schedq_entries_per_fu * 
+            (sim_conf->num_alu_fus + sim_conf->num_mul_fus + sim_conf->num_lsu_fus)); // TODO: Fix ME
     printf("Initial RAT state:\n"); //  PROVIDED
     print_rat();
     printf("\n"); //  PROVIDED
@@ -265,7 +380,7 @@ uint64_t procsim_do_cycle(procsim_stats_t *stats,
     // stage_state_update() should set *retired_mispredict_out for us
     uint64_t retired_this_cycle = stage_state_update(stats, retired_mispredict_out);
 
-    if (*retired_mispreict_out) {
+    if (*retired_mispredict_out) {
 #ifdef DEBUG
         printf("%" PRIu64 " instructions retired. Retired mispredict, so notifying driver to fetch correctly!\n", retired_this_cycle); //  PROVIDED
 #endif
