@@ -42,9 +42,12 @@ queue_t qalu;  // ALU RS queue
 queue_t qmul;  // MUL RS queue
 queue_t qlsu;  // LSU RS queue
 queue_t qstb;  // Store Buffer queue
-queue_t **qalu_pipes;  // List of ALU pipes
-queue_t **qmul_pipes;  // List of MUL pipes
-queue_t **qlsu_pipes;  // List of LSU pipes
+queue_t *qalu_pipes;  // List of ALU FU pipes
+size_t NUM_ALU_FUS;
+queue_t *qmul_pipes;  // List of MUL FU pipes
+size_t NUM_MUL_FUS;
+queue_t *qlsu_pipes;  // List of LSU FU pipes
+size_t NUM_LSU_FUS;
 
 // qentry_t *dispatch_head = NULL;
 // qentry_t *dispatch_tail = NULL;
@@ -120,6 +123,68 @@ qentry_t *fifo_pop_head(queue_t *q) {
     q->size--;
     return entry;
 }
+
+/* Search a queue by unique instruction ID 
+ * Returns NULL when not found
+ */
+qentry_t *search_queue(queue_t *q, uint64_t dyn_instruction_count) {
+    qentry_t *entry = q->head;
+    while (entry != NULL) {
+        if (entry->inst->dyn_instruction_count == dyn_instruction_count) {
+            return entry;
+        }
+        entry = entry->next;
+    }
+    return NULL;
+}
+
+/* Searches through a list of FU pipelines for a FU without an entry
+ * in the first execution cycle.
+ * Returns NULL when not found
+ */
+queue_t *find_free_fu(queue_t *fus, size_t num_fus) {
+    for (size_t i = 0; i < num_fus; i++) {
+        if (fus[i].tail == NULL || fus[i].tail->exec_cycle != 1) {
+            return &(fus[i]);
+        }
+    }
+    return NULL;
+}
+
+int insert_entry_copy_pipe_tail(qentry_t *entry, queue_t *fu) {
+    qentry_t *pipe_entry = (qentry_t *)malloc(sizeof(qentry_t));
+    qentry_copy(entry, pipe_entry);
+    pipe_entry->exec_cycle = 1;
+    return fifo_insert_tail(fu, pipe_entry);
+}
+
+
+/* Try to fire the instruction from the RS 
+ * Returns 0 on successful fire
+ * Returns -1 on instruction not ready
+ * Returns -2 on no free FUs
+ */
+int try_fire(queue_t *fus, size_t num_fus, qentry_t *entry) {
+    // Check if src pregs are ready
+    if (entry->src1_preg < 0 || reg_file[entry->src1_preg].ready) {
+        if (entry->src2_preg < 0 || reg_file[entry->src2_preg].ready) {
+            // Instruction is ready, is there a free FU?
+            queue_t *free_fu = find_free_fu(fus, num_fus);
+            if (free_fu == NULL) {
+                return -2;  // Stop scheduling because all FUs are taken
+            }
+            // Insert a copy into the pipeline
+            int success = insert_entry_copy_pipe_tail(entry, free_fu);
+            if (success != 0) {
+                printf("MY ERROR, why is the FU full?\n");
+            }
+            return success;
+        }
+    }
+    return -1;
+}
+
+
 
 // The helper functions in this#ifdef are optional and included here for your
 // convenience so you can spend more time writing your simulator logic and less
@@ -265,6 +330,62 @@ static void stage_exec(procsim_stats_t *stats) {
 // they complete (at which point stage_exec() above should free their RS).
 static void stage_schedule(procsim_stats_t *stats) {
     // TODO: fill me in
+    qentry_t *entry;
+    int success;
+
+    // Schedule from ALU RS
+    entry = qalu.head;
+    while (entry != NULL) {
+        success = try_fire(qalu_pipes, NUM_ALU_FUS, entry);
+        if (success == -2) {
+            break;  // Stop scheduling because all FUs are taken
+        }
+        entry = entry->next;
+    }
+
+    // Schedule from MUL RS
+    entry = qmul.head;
+    while (entry != NULL) {
+        success = try_fire(qmul_pipes, NUM_MUL_FUS, entry);
+        if (success == -2) {
+            break;  // Stop scheduling because all FUs are taken
+        }
+        entry = entry->next;
+    }
+
+    // Schedule from LS RS
+    entry = qlsu.head;
+    while (entry != NULL) {
+        /************* Memory Disambiguation Logic *************/
+        int ok_to_fire = true;
+        if (entry->inst->opcode == OPCODE_LOAD) {
+            qentry_t *preceding_op_entry = qlsu.head;
+            // Check from the start of the RS Queue up to this instruction
+            // if there are any stores
+            while (preceding_op_entry != entry) {
+                if (preceding_op_entry->inst->opcode == OPCODE_STORE) {
+                    ok_to_fire = false;
+                    break;
+                }
+                preceding_op_entry = preceding_op_entry->next;
+            }
+        } else {
+            // A store can only occur if it's at the head of the LSU RS
+            if (entry != qlsu.head) {
+                ok_to_fire = false;
+            }
+        }
+        if (!ok_to_fire) {
+            break;
+        }
+        /*******************************************************/
+        success = try_fire(qalu_pipes, NUM_ALU_FUS, entry);
+        if (success == -2) {
+            break;  // Stop scheduling because all FUs are taken
+        }
+        entry = entry->next;
+    }
+
 #ifdef DEBUG
     printf("Stage Schedule: \n"); //  PROVIDED
 #endif
@@ -293,15 +414,15 @@ static void stage_dispatch(procsim_stats_t *stats) {
             return;  // No room in the ROB
         }
 
-        unsigned long dest_preg = -1;
+        unsigned long dest_preg_num = -1;
         if (inst->dest >= 0) {
             for (unsigned long i = 32; i < 32 + NUM_PREGS; i++) {
                 if (reg_file[i].free) {
-                    dest_preg = i;
+                    dest_preg_num = i;
                     break;
                 }
             }
-            if (dest_preg < 0) return;  // No free pregs
+            if (dest_preg_num < 0) return;  // No free pregs
         }
 
         int success = -1;
@@ -347,11 +468,26 @@ static void stage_dispatch(procsim_stats_t *stats) {
                 break;
         }
 
-        if (inst->src1 >= 0) entry->src1_preg = RAT[inst->src1];
-        if (inst->src2 >= 0) entry->src2_preg = RAT[inst->src2];
+        // Set physical registers in entry
+        if (inst->src1 >= 0) {
+            entry->src1_preg = RAT[inst->src1];
+        } else {
+            entry->src1_preg = -1;
+        }
+
+        if (inst->src2 >= 0) {
+            entry->src2_preg = RAT[inst->src2];
+        } else {
+            entry->src2_preg = -1;
+        }
+
         if (inst->dest >= 0) {
             entry->prev_preg = RAT[inst->dest];  // Save previous preg
-            RAT[inst->dest] = dest_preg;
+            entry->dest_preg = dest_preg_num;
+            RAT[inst->dest] = dest_preg_num;
+            reg_file[dest_preg_num].ready = false;
+        } else {
+            entry->dest_preg = -1;
         }
 
         qentry_t *rob_entry = (qentry_t *)malloc(sizeof(qentry_t));
@@ -394,12 +530,36 @@ static void stage_fetch(procsim_stats_t *stats) {
 void procsim_init(const procsim_conf_t *sim_conf, procsim_stats_t *stats) {
     FETCH_WIDTH = sim_conf->fetch_width;
     NUM_PREGS = sim_conf->num_pregs;
+    size_t max_rob_entries = 32 + NUM_PREGS;
+
+    NUM_ALU_FUS = sim_conf->num_alu_fus;
+    NUM_MUL_FUS = sim_conf->num_mul_fus;
+    NUM_LSU_FUS = sim_conf->num_lsu_fus;
 
     queue_init(&qdis, -1);
-    queue_init(&qalu, sim_conf->num_alu_fus * sim_conf->num_schedq_entries_per_fu);
-    queue_init(&qmul, sim_conf->num_mul_fus * sim_conf->num_schedq_entries_per_fu);
-    queue_init(&qlsu, sim_conf->num_lsu_fus * sim_conf->num_schedq_entries_per_fu);
-    queue_init(&qrob, 32 + NUM_PREGS);
+    queue_init(&qalu, NUM_ALU_FUS * sim_conf->num_schedq_entries_per_fu);
+    queue_init(&qmul, NUM_MUL_FUS * sim_conf->num_schedq_entries_per_fu);
+    queue_init(&qlsu, NUM_LSU_FUS * sim_conf->num_schedq_entries_per_fu);
+    queue_init(&qrob, max_rob_entries);
+
+    // Initialize FU pipe queues
+    qalu_pipes = (queue_t *)calloc(NUM_ALU_FUS, sizeof(queue_t));
+    for (size_t i = 0; i < NUM_ALU_FUS; i++) {
+        queue_init(&(qalu_pipes[i]), 1);  // 1 stage pipe
+    }
+
+    qmul_pipes = (queue_t *)calloc(NUM_MUL_FUS, sizeof(queue_t));
+    for (size_t i = 0; i < NUM_MUL_FUS; i++) {
+        queue_init(&(qmul_pipes[i]), 3);  // 3 stage pipe
+    }
+
+    qlsu_pipes = (queue_t *)calloc(NUM_LSU_FUS, sizeof(queue_t));
+    for (size_t i = 0; i < NUM_LSU_FUS; i++) {
+        queue_init(&(qlsu_pipes[i]), 1);  // 1 stage pipe
+    }
+
+    // Initialize store buffer
+    queue_init(&qstb, max_rob_entries);
 
     // Initialize the register file
     reg_file = (reg_t *)malloc(sizeof(reg_t) * (32 + sim_conf->num_pregs));
