@@ -14,6 +14,10 @@
 // TODO: Define any useful data structures and functions here
 //
 // qentry_t is used for all queue data structures
+
+
+
+
 typedef struct queue_entry {
     const inst_t *inst;
     unsigned long src1_preg;
@@ -26,16 +30,30 @@ typedef struct queue_entry {
     struct queue_entry *sched_next;
     struct queue_entry *rob_next;
 } qentry_t;
-qentry_t *dispatch_head = NULL;
-qentry_t *dispatch_tail = NULL;
-qentry_t *ROB_head = NULL;
-qentry_t *ROB_tail = NULL;
-qentry_t *ALU_RS_head = NULL;
-qentry_t *ALU_RS_tail = NULL;
-qentry_t *MUL_RS_head = NULL;
-qentry_t *MUL_RS_tail = NULL;
-qentry_t *LS_RS_head = NULL;
-qentry_t *LS_RS_tail = NULL;
+
+typedef struct queue {
+    qentry_t *head;
+    qentry_t *tail;
+    size_t max_size;
+    size_t size;
+} queue_t
+
+queue_t qdis;  // Dispatch queue
+queue_t qrob;  // ROB queue
+queue_t qalu;  // ALU RS queue
+queue_t qmul;  // MUL RS queue
+queue_t qlsu;  // LSU RS queue
+
+// qentry_t *dispatch_head = NULL;
+// qentry_t *dispatch_tail = NULL;
+// qentry_t *ROB_head = NULL;
+// qentry_t *ROB_tail = NULL;
+// qentry_t *ALU_RS_head = NULL;
+// qentry_t *ALU_RS_tail = NULL;
+// qentry_t *MUL_RS_head = NULL;
+// qentry_t *MUL_RS_tail = NULL;
+// qentry_t *LS_RS_head = NULL;
+// qentry_t *LS_RS_tail = NULL;
 
 typedef struct reg {
     bool free;
@@ -46,14 +64,55 @@ unsigned long RAT[32];
 struct reg *reg_file;
 size_t FETCH_WIDTH;
 size_t NUM_PREGS;
-size_t NUM_ROB_ENTRIES;
-size_t MAX_ROB_ENTRIES;
-size_t NUM_ALU_RS_ENTRIES;
-size_t MAX_ALU_RS_ENTRIES;
-size_t NUM_MUL_RS_ENTRIES;
-size_t MAX_MUL_RS_ENTRIES;
-size_t NUM_LS_RS_ENTRIES;
-size_t MAX_LS_RS_ENTRIES;
+// size_t NUM_ROB_ENTRIES;
+// size_t MAX_ROB_ENTRIES;
+// size_t NUM_ALU_RS_ENTRIES;
+// size_t MAX_ALU_RS_ENTRIES;
+// size_t NUM_MUL_RS_ENTRIES;
+// size_t MAX_MUL_RS_ENTRIES;
+// size_t NUM_LS_RS_ENTRIES;
+// size_t MAX_LS_RS_ENTRIES;
+
+/* initialize queue, pass max_size == NULL for unlimited size */
+void queue_init(queue_t *queue, size_t max_size) {
+    queue->head = NULL;
+    queue->tail = NULL;
+    queue->max_size = max_size;
+    queue->size = 0;
+}
+
+/* insert entry at the tail of the FIFO queue.
+ * Returns 0 on success
+ * Returns -1 on full queue
+ */
+int fifo_insert_tail(queue_t *q, qentry_t *entry) {
+    // Check if fifo is full
+    if (q->max_size != NULL && q->size >= q->max_size) {
+        return -1;
+    }
+    if (q->head == NULL) {
+        q->head = entry;
+    }
+    if (q->tail != NULL) {
+        q->tail->next = entry;
+    }
+    q->tail = entry;
+    q->size++;
+    return 0;
+}
+
+/* pop the FIFO queue head.
+ * Returns NULL if FIFO is empty
+ */
+qentry_t *fifo_pop_head(queue_t *q) {
+    if (q->head == NULL) {
+        return NULL;
+    }
+    qentry_t *entry = q->head;
+    q->head = entry->next;
+    q->size--;
+    return entry;
+}
 
 // The helper functions in this#ifdef are optional and included here for your
 // convenience so you can spend more time writing your simulator logic and less
