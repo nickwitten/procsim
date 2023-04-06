@@ -24,11 +24,9 @@ typedef struct queue_entry {
     unsigned long src2_preg;
     unsigned long dest_preg;
     unsigned long prev_preg;
+    uint8_t exec_cycle;
     bool completed;
-    struct queue_entry *disp_next;
-    struct queue_entry *sched_prev;
-    struct queue_entry *sched_next;
-    struct queue_entry *rob_next;
+    struct queue_entry *next;
 } qentry_t;
 
 typedef struct queue {
@@ -36,13 +34,17 @@ typedef struct queue {
     qentry_t *tail;
     size_t max_size;
     size_t size;
-} queue_t
+} queue_t;
 
 queue_t qdis;  // Dispatch queue
 queue_t qrob;  // ROB queue
 queue_t qalu;  // ALU RS queue
 queue_t qmul;  // MUL RS queue
 queue_t qlsu;  // LSU RS queue
+queue_t qstb;  // Store Buffer queue
+queue_t **qalu_pipes;  // List of ALU pipes
+queue_t **qmul_pipes;  // List of MUL pipes
+queue_t **qlsu_pipes;  // List of LSU pipes
 
 // qentry_t *dispatch_head = NULL;
 // qentry_t *dispatch_tail = NULL;
@@ -64,21 +66,24 @@ unsigned long RAT[32];
 struct reg *reg_file;
 size_t FETCH_WIDTH;
 size_t NUM_PREGS;
-// size_t NUM_ROB_ENTRIES;
-// size_t MAX_ROB_ENTRIES;
-// size_t NUM_ALU_RS_ENTRIES;
-// size_t MAX_ALU_RS_ENTRIES;
-// size_t NUM_MUL_RS_ENTRIES;
-// size_t MAX_MUL_RS_ENTRIES;
-// size_t NUM_LS_RS_ENTRIES;
-// size_t MAX_LS_RS_ENTRIES;
 
-/* initialize queue, pass max_size == NULL for unlimited size */
+/* initialize queue, pass max_size == -1 for unlimited size */
 void queue_init(queue_t *queue, size_t max_size) {
     queue->head = NULL;
     queue->tail = NULL;
     queue->max_size = max_size;
     queue->size = 0;
+}
+
+/* copy all values of qentry src to dst */
+void qentry_copy(qentry_t *src, qentry_t *dst) {
+    dst->inst = src->inst;
+    dst->src1_preg = src->src1_preg;
+    dst->src2_preg = src->src2_preg;
+    dst->dest_preg = src->dest_preg;
+    dst->prev_preg = src->prev_preg;
+    dst->exec_cycle = src->exec_cycle;
+    dst->completed = src->completed;
 }
 
 /* insert entry at the tail of the FIFO queue.
@@ -87,7 +92,7 @@ void queue_init(queue_t *queue, size_t max_size) {
  */
 int fifo_insert_tail(queue_t *q, qentry_t *entry) {
     // Check if fifo is full
-    if (q->max_size != NULL && q->size >= q->max_size) {
+    if (q->max_size >= 0 && q->size >= q->max_size) {
         return -1;
     }
     if (q->head == NULL) {
@@ -96,6 +101,7 @@ int fifo_insert_tail(queue_t *q, qentry_t *entry) {
     if (q->tail != NULL) {
         q->tail->next = entry;
     }
+    entry->next = NULL;
     q->tail = entry;
     q->size++;
     return 0;
@@ -110,6 +116,7 @@ qentry_t *fifo_pop_head(queue_t *q) {
     }
     qentry_t *entry = q->head;
     q->head = entry->next;
+    entry->next = NULL;
     q->size--;
     return entry;
 }
@@ -173,8 +180,8 @@ static void print_prf(void) {
 // This will print the state of the ROB where instructions are identified by their dyn_instruction_count
 static void print_rob(void) {
     size_t printed_idx = 0;
-    printf("\tAllocated Entries in ROB: %lu\n", 0ul); // TODO: Fix Me
-    for (qentry_t *entry = ROB_head; entry != NULL; entry = entry->rob_next) { // TODO: Fix Me
+    printf("\tAllocated Entries in ROB: %lu\n", qrob.size); // TODO: Fix Me
+    for (qentry_t *entry = qrob.head; entry != NULL; entry = entry->next) { // TODO: Fix Me
         if (printed_idx == 0) {
             printf("    { dyncount=%05" PRIu64 ", completed: %d, mispredict: %d }", entry->inst->dyn_instruction_count, entry->completed, entry->inst->mispredict); // TODO: Fix Me
         } else if (!(printed_idx & 0x3)) {
@@ -274,16 +281,16 @@ static void stage_schedule(procsim_stats_t *stats) {
 // The PDF has details.
 static void stage_dispatch(procsim_stats_t *stats) {
     // TODO: fill me in
-    // Find the first empty entry in the ROB
     while (1) {
-        qentry_t *entry = dispatch_head;
+        // Don't commit any changes to the queues until we know all conditions are satisfied
+        qentry_t *entry = qdis.head;  // Get dispatch queue head
         if (entry == NULL) {
-            return;
+            return;  // Dispatch queue was empty
         }
         const inst_t *inst = entry->inst;
 
-        if (NUM_ROB_ENTRIES >= MAX_ROB_ENTRIES) {
-            return;
+        if (qrob.size >= qrob.max_size) {
+            return;  // No room in the ROB
         }
 
         unsigned long dest_preg = -1;
@@ -294,39 +301,47 @@ static void stage_dispatch(procsim_stats_t *stats) {
                     break;
                 }
             }
-            return;  // No free pregs
+            if (dest_preg < 0) return;  // No free pregs
         }
 
-        // From here down are changes to the state of the system //
-
+        int success = -1;
         switch(inst->opcode) {
+            case OPCODE_BRANCH:
+                // ??? Check if mispredict here ??? //
+                // Fallthrough to ALU
             case OPCODE_ADD:
-                if (NUM_ALU_RS_ENTRIES >= MAX_ALU_RS_ENTRIES) return;
-                if (ALU_RS_head == NULL) ALU_RS_head = entry;
-                if (ALU_RS_tail != NULL) ALU_RS_tail->sched_next = entry;
-                entry->sched_prev = ALU_RS_tail;
-                ALU_RS_tail = entry;
-                NUM_ALU_RS_ENTRIES++;
+                if (qalu.size < qalu.max_size) {
+                    success = fifo_insert_tail(&qalu, fifo_pop_head(&qdis));
+                    if (success != 0) {
+                        printf("MY ERROR, why was the ALU RS full?\n");
+                        return;
+                    }
+                } else {
+                    return;
+                }
                 break;
             case OPCODE_MUL:
-                if (NUM_MUL_RS_ENTRIES >= MAX_MUL_RS_ENTRIES) return;
-                if (MUL_RS_head == NULL) MUL_RS_head = entry;
-                if (MUL_RS_tail != NULL) MUL_RS_tail->sched_next = entry;
-                entry->sched_prev = MUL_RS_tail;
-                MUL_RS_tail = entry;
-                NUM_MUL_RS_ENTRIES++;
+                if (qmul.size < qmul.max_size) {
+                    success = fifo_insert_tail(&qmul, fifo_pop_head(&qdis));
+                    if (success != 0) {
+                        printf("MY ERROR, why was the MUL RS full?\n");
+                        return;
+                    }
+                } else {
+                    return;
+                }
                 break;
             case OPCODE_LOAD:
             case OPCODE_STORE:
-                if (NUM_LS_RS_ENTRIES >= MAX_LS_RS_ENTRIES) return;
-                if (LS_RS_head == NULL) LS_RS_head = entry;
-                if (LS_RS_tail != NULL) LS_RS_tail->sched_next = entry;
-                entry->sched_prev = LS_RS_tail;
-                LS_RS_tail = entry;
-                NUM_LS_RS_ENTRIES++;
-                break;
-            case OPCODE_BRANCH:
-                ////??????
+                if (qlsu.size < qlsu.max_size) {
+                    success = fifo_insert_tail(&qlsu, fifo_pop_head(&qdis));
+                    if (success != 0) {
+                        printf("MY ERROR, why was the LSU RS full?\n");
+                        return;
+                    }
+                } else {
+                    return;
+                }
                 break;
             default:
                 break;
@@ -339,15 +354,13 @@ static void stage_dispatch(procsim_stats_t *stats) {
             RAT[inst->dest] = dest_preg;
         }
 
-        // Place in the ROB
-        if (ROB_tail != NULL) {
-            ROB_tail->rob_next = entry;
+        qentry_t *rob_entry = (qentry_t *)malloc(sizeof(qentry_t));
+        qentry_copy(entry, rob_entry);
+        success = fifo_insert_tail(&qrob, rob_entry);
+        if (success != 0) {
+            printf("MY ERROR, why was the ROB full?\n");
+            return;
         }
-        if (ROB_head == NULL) ROB_head = entry;
-        ROB_tail = entry;
-        NUM_ROB_ENTRIES++;
-        // Remove from dispatch head
-        dispatch_head = entry->disp_next;
     }
 
 #ifdef DEBUG
@@ -364,19 +377,12 @@ static void stage_fetch(procsim_stats_t *stats) {
     for (size_t i = 0; i < FETCH_WIDTH; i++) {
         const inst_t *inst = procsim_driver_read_inst();
         if (inst == NULL) return;
-        qentry_t *entry = (qentry_t *)malloc(sizeof(qentry_t));
+        qentry_t *entry = (qentry_t *)calloc(1, sizeof(qentry_t));
         entry->inst = inst;
-        entry->disp_next = NULL;
-        entry->sched_next = NULL;
-        entry->rob_next = NULL;
-        entry->completed = false;
-        if (dispatch_tail != NULL) {
-            dispatch_tail->disp_next = entry;
+        int success = fifo_insert_tail(&qdis, entry);
+        if (success != 0) {
+            printf("MY ERROR, why couldn't we add to the dispatch queue?\n");
         }
-        if (dispatch_head == NULL) {
-            dispatch_head = entry;  // The queue was empty
-        }
-        dispatch_tail = entry;
     }
 #ifdef DEBUG
     printf("Stage Fetch: \n"); //  PROVIDED
@@ -388,14 +394,12 @@ static void stage_fetch(procsim_stats_t *stats) {
 void procsim_init(const procsim_conf_t *sim_conf, procsim_stats_t *stats) {
     FETCH_WIDTH = sim_conf->fetch_width;
     NUM_PREGS = sim_conf->num_pregs;
-    NUM_ROB_ENTRIES = 0;
-    MAX_ROB_ENTRIES = 32 + NUM_PREGS;
-    NUM_ALU_RS_ENTRIES = 0;
-    MAX_ALU_RS_ENTRIES = sim_conf->num_alu_fus * sim_conf->num_schedq_entries_per_fu;
-    NUM_MUL_RS_ENTRIES = 0;
-    MAX_MUL_RS_ENTRIES = sim_conf->num_mul_fus * sim_conf->num_schedq_entries_per_fu;
-    NUM_LS_RS_ENTRIES = 0;
-    MAX_LS_RS_ENTRIES = sim_conf->num_lsu_fus * sim_conf->num_schedq_entries_per_fu;
+
+    queue_init(&qdis, -1);
+    queue_init(&qalu, sim_conf->num_alu_fus * sim_conf->num_schedq_entries_per_fu);
+    queue_init(&qmul, sim_conf->num_mul_fus * sim_conf->num_schedq_entries_per_fu);
+    queue_init(&qlsu, sim_conf->num_lsu_fus * sim_conf->num_schedq_entries_per_fu);
+    queue_init(&qrob, 32 + NUM_PREGS);
 
     // Initialize the register file
     reg_file = (reg_t *)malloc(sizeof(reg_t) * (32 + sim_conf->num_pregs));
@@ -403,17 +407,11 @@ void procsim_init(const procsim_conf_t *sim_conf, procsim_stats_t *stats) {
         reg_file[i].free = 1;
         reg_file[i].ready = 1;
     }
+
     // Initialize RAT with respective architectural reg number
     for (int i = 0; i < 32; i++) {
         RAT[i] = i;
     }
-//     // Initialize reservation stations
-//     ALU_RS = (qentry_t*)malloc(sizeof(qentry_t) *
-//             sim_conf->num_schedq_entries_per_fu * sim_conf->num_alu_fus);
-//     MUL_RS = (qentry_t*)malloc(sizeof(qentry_t) *
-//             sim_conf->num_schedq_entries_per_fu * sim_conf->num_mul_fus);
-//     LS_RS = (qentry_t*)malloc(sizeof(qentry_t) *
-//             sim_conf->num_schedq_entries_per_fu * sim_conf->num_lsu_fus);
 
 #ifdef DEBUG
     printf("\nScheduling queue capacity: %lu instructions\n", sim_conf->num_schedq_entries_per_fu * 
@@ -460,9 +458,9 @@ uint64_t procsim_do_cycle(procsim_stats_t *stats,
     }
 
 #ifdef DEBUG
-    printf("End-of-cycle dispatch queue usage: %lu\n", 0ul); // TODO: Fix Me
-    printf("End-of-cycle sched queue usage: %lu\n", 0ul); // TODO: Fix Me
-    printf("End-of-cycle ROB usage: %lu\n", 0ul); // TODO: Fix Me
+    printf("End-of-cycle dispatch queue usage: %lu\n", qdis.size); // TODO: Fix Me
+    printf("End-of-cycle sched queue usage: %lu\n", qalu.size + qmul.size + qlsu.size); // TODO: Fix Me
+    printf("End-of-cycle ROB usage: %lu\n", qrob.size); // TODO: Fix Me
     printf("End-of-cycle RAT state:\n"); //  PROVIDED
     print_rat();
     printf("End-of-cycle Physical Register File state:\n"); //  PROVIDED
