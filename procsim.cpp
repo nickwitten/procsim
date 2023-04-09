@@ -38,11 +38,9 @@ typedef struct queue {
     size_t size;
 } queue_t;
 
-queue_t qdis;  // Dispatch queue
+queue_t qdisp;  // Dispatch queue
 queue_t qrob;  // ROB queue
-queue_t qalu_rs;  // ALU RS queue
-queue_t qmul_rs;  // MUL RS queue
-queue_t qlsu_rs;  // LSU RS queue
+queue_t qsched;  // Schedule queue
 queue_t qstb;  // Store Buffer queue
 queue_t *qalu_fus;  // List of ALU FU pipes
 size_t NUM_ALU_FUS;
@@ -50,17 +48,6 @@ queue_t *qmul_fus;  // List of MUL FU pipes
 size_t NUM_MUL_FUS;
 queue_t *qlsu_fus;  // List of LSU FU pipes
 size_t NUM_LSU_FUS;
-
-// qentry_t *dispatch_head = NULL;
-// qentry_t *dispatch_tail = NULL;
-// qentry_t *ROB_head = NULL;
-// qentry_t *ROB_tail = NULL;
-// qentry_t *ALU_RS_head = NULL;
-// qentry_t *ALU_RS_tail = NULL;
-// qentry_t *MUL_RS_head = NULL;
-// qentry_t *MUL_RS_tail = NULL;
-// qentry_t *LS_RS_head = NULL;
-// qentry_t *LS_RS_tail = NULL;
 
 typedef struct reg {
     bool free;
@@ -474,19 +461,19 @@ static void stage_exec(procsim_stats_t *stats) {
     printf("Progressing ALU units\n");  // PROVIDED
 #endif
 
-    progress_function_units(&qalu_rs, qalu_fus, NUM_ALU_FUS, 1);
+    progress_function_units(&qsched, qalu_fus, NUM_ALU_FUS, 1);
 
 #ifdef DEBUG
     printf("Progressing MUL units\n");  // PROVIDED
 #endif
 
-    progress_function_units(&qmul_rs, qmul_fus, NUM_MUL_FUS, 3);
+    progress_function_units(&qsched, qmul_fus, NUM_MUL_FUS, 3);
 
 #ifdef DEBUG
     printf("Progressing LSU units for loads and stores and processing result busses\n");  // PROVIDED
 #endif
 
-    progress_function_units(&qlsu_rs, qlsu_fus, NUM_LSU_FUS, L1_HIT_TIME);
+    progress_function_units(&qsched, qlsu_fus, NUM_LSU_FUS, L1_HIT_TIME);
 }
 
 // Optional helper function which is responsible for looking through the
@@ -504,71 +491,54 @@ static void stage_schedule(procsim_stats_t *stats) {
 #endif
     qentry_t *entry;
     int success;
+    int ok_to_fire;
+    qentry_t *preceding_op_entry;
 
-    // Schedule from ALU RS
-    entry = qalu_rs.head;
+    // Schedule
+    entry = qsched.head;
     while (entry != NULL) {
         if (!entry->fired) {
-            success = try_fire(qalu_fus, NUM_ALU_FUS, entry);
-            if (success == 0) {
-                entry->fired = true;
-            } else if (success == -2) {
-                break;  // Stop scheduling because all FUs are taken
-            }
-        }
-        entry = entry->next;
-    }
-
-    // Schedule from MUL RS
-    entry = qmul_rs.head;
-    while (entry != NULL) {
-        if (!entry->fired) {
-            success = try_fire(qmul_fus, NUM_MUL_FUS, entry);
-            if (success == 0) {
-                entry->fired = true;
-            } else if (success == -2) {
-                break;  // Stop scheduling because all FUs are taken
-            }
-        }
-        entry = entry->next;
-    }
-
-    // Schedule from LS RS
-    entry = qlsu_rs.head;
-    while (entry != NULL) {
-        if (!entry->fired) {
-            /************* Memory Disambiguation Logic *************/
-            int ok_to_fire = true;
-            if (entry->inst->opcode == OPCODE_LOAD) {
-                qentry_t *preceding_op_entry = qlsu_rs.head;
-                // Check from the start of the RS Queue up to this instruction
-                // if there are any stores
-                while (preceding_op_entry != entry) {
-                    if (preceding_op_entry->inst->opcode == OPCODE_STORE
-                            && !preceding_op_entry->completed) {
-                        ok_to_fire = false;
-                        break;
+            ok_to_fire = true;
+            success = -1;
+            switch (entry->inst->opcode) {
+                case OPCODE_BRANCH:
+                case OPCODE_ADD:
+                    success = try_fire(qalu_fus, NUM_ALU_FUS, entry);
+                    break;
+                case OPCODE_MUL:
+                    success = try_fire(qmul_fus, NUM_MUL_FUS, entry);
+                    break;
+                case OPCODE_LOAD:
+                case OPCODE_STORE:
+                    /************* Memory Disambiguation Logic *************/
+                    preceding_op_entry = qsched.head;
+                    // Check from the start of the schedule queue up to this instruction
+                    // if there are any load/stores
+                    while (preceding_op_entry != entry) {
+                        if (!preceding_op_entry->completed) {
+                            if (preceding_op_entry->inst->opcode == OPCODE_STORE) {
+                                ok_to_fire = false;
+                            }
+                            if (preceding_op_entry->inst->opcode == OPCODE_LOAD) {
+                                if (entry->inst->opcode == OPCODE_STORE) {
+                                    ok_to_fire = false;
+                                }
+                            }
+                        }
+                        preceding_op_entry = preceding_op_entry->next;
                     }
-                    preceding_op_entry = preceding_op_entry->next;
-                }
-            } else {
-                // A store can only occur if it's at the head of the LSU RS
-                if (entry != qlsu_rs.head) {
-                    ok_to_fire = false;
-                }
+                    /*******************************************************/
+                    if (ok_to_fire) {
+                        success = try_fire(qlsu_fus, NUM_LSU_FUS, entry);
+                    } else {
+                        success = -1;
+                    }
+                    break;
+                default:
+                    break;
             }
-            if (!ok_to_fire) {
-#ifdef DEBUG
-                printf("\tUnable to fire to LSU due to disambiguation\n");
-                break;
-#endif
-            }
-            /*******************************************************/
-            success = try_fire(qlsu_fus, NUM_LSU_FUS, entry);
             if (success == 0) {
                 entry->fired = true;
-            } else if (success == -2) {
-                break;  // Stop scheduling because all FUs are taken
             }
         }
         entry = entry->next;
@@ -589,12 +559,12 @@ static void stage_dispatch(procsim_stats_t *stats) {
 #ifdef DEBUG
     printf("Stage Dispatch: \n"); //  PROVIDED
 #endif
-    qentry_t *entry = qdis.head;  // Start at dispatch queue head
+    qentry_t *entry = qdisp.head;  // Start at dispatch queue head
     if (stats->cycles == 33) {
         int x = 0; x++;
     }
     while (1) {
-        entry = qdis.head;  // Keep getting dispatch head
+        entry = qdisp.head;  // Keep getting dispatch head
         if (entry == NULL) {
             break;
         }
@@ -627,48 +597,16 @@ static void stage_dispatch(procsim_stats_t *stats) {
 
         // Now queue changes will be committed
 
-        // Add to respective RS
+        // Add to schedule queue
         int success = -1;
-        switch(inst->opcode) {
-            case OPCODE_BRANCH:
-                // ??? Check if mispredict here ??? //
-                // Fallthrough to ALU
-            case OPCODE_ADD:
-                if (qalu_rs.size < qalu_rs.max_size) {
-                    success = fifo_insert_tail(&qalu_rs, fifo_pop_head(&qdis));
-                    if (success != 0) {
-                        printf("MY ERROR, why was the ALU RS full?\n");
-                        return;
-                    }
-                } else {
-                    return;
-                }
-                break;
-            case OPCODE_MUL:
-                if (qmul_rs.size < qmul_rs.max_size) {
-                    success = fifo_insert_tail(&qmul_rs, fifo_pop_head(&qdis));
-                    if (success != 0) {
-                        printf("MY ERROR, why was the MUL RS full?\n");
-                        return;
-                    }
-                } else {
-                    return;
-                }
-                break;
-            case OPCODE_LOAD:
-            case OPCODE_STORE:
-                if (qlsu_rs.size < qlsu_rs.max_size) {
-                    success = fifo_insert_tail(&qlsu_rs, fifo_pop_head(&qdis));
-                    if (success != 0) {
-                        printf("MY ERROR, why was the LSU RS full?\n");
-                        return;
-                    }
-                } else {
-                    return;
-                }
-                break;
-            default:
-                break;
+        if (qsched.size < qsched.max_size) {
+            success = fifo_insert_tail(&qsched, fifo_pop_head(&qdisp));
+            if (success != 0) {
+                printf("MY ERROR, why was the schedule queue full?\n");
+                return;
+            }
+        } else {
+            return;
         }
 
         // Set physical registers in entry
@@ -724,7 +662,7 @@ static void stage_fetch(procsim_stats_t *stats) {
         if (inst == NULL) return;
         qentry_t *entry = (qentry_t *)calloc(1, sizeof(qentry_t));
         entry->inst = inst;
-        int success = fifo_insert_tail(&qdis, entry);
+        int success = fifo_insert_tail(&qdisp, entry);
         if (success != 0) {
             printf("MY ERROR, why couldn't we add to the dispatch queue?\n");
         }
@@ -752,10 +690,8 @@ void procsim_init(const procsim_conf_t *sim_conf, procsim_stats_t *stats) {
     NUM_MUL_FUS = sim_conf->num_mul_fus;
     NUM_LSU_FUS = sim_conf->num_lsu_fus;
 
-    queue_init(&qdis, -1);
-    queue_init(&qalu_rs, NUM_ALU_FUS * sim_conf->num_schedq_entries_per_fu);
-    queue_init(&qmul_rs, NUM_MUL_FUS * sim_conf->num_schedq_entries_per_fu);
-    queue_init(&qlsu_rs, NUM_LSU_FUS * sim_conf->num_schedq_entries_per_fu);
+    queue_init(&qdisp, -1);
+    queue_init(&qsched, sim_conf->num_schedq_entries_per_fu * (NUM_ALU_FUS + NUM_MUL_FUS + NUM_LSU_FUS));
     queue_init(&qrob, max_rob_entries);
 
     // Initialize FU pipe queues
@@ -838,8 +774,8 @@ uint64_t procsim_do_cycle(procsim_stats_t *stats,
     }
 
 #ifdef DEBUG
-    printf("End-of-cycle dispatch queue usage: %lu\n", qdis.size); // TODO: Fix Me
-    printf("End-of-cycle sched queue usage: %lu\n", qalu_rs.size + qmul_rs.size + qlsu_rs.size); // TODO: Fix Me
+    printf("End-of-cycle dispatch queue usage: %lu\n", qdisp.size); // TODO: Fix Me
+    printf("End-of-cycle sched queue usage: %lu\n", qsched.size); // TODO: Fix Me
     printf("End-of-cycle ROB usage: %lu\n", qrob.size); // TODO: Fix Me
     printf("End-of-cycle RAT state:\n"); //  PROVIDED
     print_rat();
@@ -853,18 +789,17 @@ uint64_t procsim_do_cycle(procsim_stats_t *stats,
 
     // TODO: Increment max_usages and avg_usages in stats here!
     stats->cycles++;
-    if (qdis.size >= stats->dispq_max_size) {
-        stats->dispq_max_size = qdis.size;
+    if (qdisp.size >= stats->dispq_max_size) {
+        stats->dispq_max_size = qdisp.size;
     }
-    uint64_t schedq_size = qalu_rs.size + qmul_rs.size + qlsu_rs.size;
-    if (schedq_size >= stats->schedq_max_size) {
-        stats->schedq_max_size = schedq_size;
+    if (qsched.size >= stats->schedq_max_size) {
+        stats->schedq_max_size = qsched.size;
     }
     if (qrob.size >= stats->rob_max_size) {
         stats->rob_max_size = qrob.size;
     }
-    stats->dispq_avg_size += qdis.size;
-    stats->schedq_avg_size += schedq_size;
+    stats->dispq_avg_size += qdisp.size;
+    stats->schedq_avg_size += qsched.size;
     stats->rob_avg_size += qrob.size;
 
     // Return the number of instructions we retired this cycle (including the
