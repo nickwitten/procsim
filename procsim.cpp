@@ -26,6 +26,7 @@ typedef struct queue_entry {
     int prev_preg;
     uint8_t exec_cycle;
     bool store_buffer_hit;
+    bool fired;
     bool completed;
     struct queue_entry *next;
 } qentry_t;
@@ -88,6 +89,7 @@ void qentry_copy(qentry_t *src, qentry_t *dst) {
     dst->prev_preg = src->prev_preg;
     dst->exec_cycle = src->exec_cycle;
     dst->store_buffer_hit = src->store_buffer_hit;
+    dst->fired = src->fired;
     dst->completed = src->completed;
 }
 
@@ -121,6 +123,7 @@ qentry_t *fifo_pop_head(queue_t *q) {
     }
     qentry_t *entry = q->head;
     q->head = entry->next;
+    if (q->tail == entry) q->tail = NULL;
     entry->next = NULL;
     q->size--;
     return entry;
@@ -159,6 +162,7 @@ qentry_t *fifo_search_and_pop(queue_t *q, uint64_t dyn_instruction_count) {
                 q->tail = prev;
             }
             prev->next = entry->next;
+            q->size--;
             entry->next = NULL;
             return entry;
         }
@@ -182,144 +186,15 @@ queue_t *find_free_fu(queue_t *fus, size_t num_fus) {
     return NULL;
 }
 
-/* Copies an entry and places it in the first stage of the function unit */
-int insert_entry_copy_pipe_tail(qentry_t *entry, queue_t *fu) {
-    qentry_t *pipe_entry = (qentry_t *)malloc(sizeof(qentry_t));
-    qentry_copy(entry, pipe_entry);
-    pipe_entry->exec_cycle = 0;
-    return fifo_insert_tail(fu, pipe_entry);
-}
-
-
-/* Try to fire the instruction from the RS 
- * Returns 0 on successful fire
- * Returns -1 on instruction not ready
- * Returns -2 on no free FUs
+/* Copies the entry and places it at the tail of the queue
+ * Returns pointer to the new copy
  */
-int try_fire(queue_t *fus, size_t num_fus, qentry_t *entry) {
-    // Check if src pregs are ready
-    if (entry->src1_preg < 0 || reg_file[entry->src1_preg].ready) {
-        if (entry->src2_preg < 0 || reg_file[entry->src2_preg].ready) {
-            // Instruction is ready, is there a free FU?
-            queue_t *free_fu = find_free_fu(fus, num_fus);
-            if (free_fu == NULL) {
-                return -2;  // Stop scheduling because all FUs are taken
-            }
-            // Insert a copy into the pipeline
-            int success = insert_entry_copy_pipe_tail(entry, free_fu);
-            if (success != 0) {
-                printf("MY ERROR, why is the FU full?\n");
-            }
-            return success;
-        }
-    }
-    return -1;
+qentry_t *fifo_insert_copy_tail(queue_t *q, qentry_t *entry) {
+    qentry_t *new_entry = (qentry_t *)malloc(sizeof(qentry_t));
+    qentry_copy(entry, new_entry);
+    fifo_insert_tail(q, new_entry);
+    return new_entry;
 }
-
-qentry_t *progress_function_unit(queue_t *fu, size_t pipe_length) {
-    qentry_t *entry;
-
-    // If the function unit is empty, don't need to progress anything
-    if (fu->head == NULL) {
-        return NULL;
-    }
-    // Progress each entry
-    entry = fu->head;
-    while (entry != NULL) {
-        entry->exec_cycle++;
-        /******** Special operations for load **********/
-        if (entry->inst->opcode == OPCODE_LOAD && entry->exec_cycle == 1) {
-            // Search the store buffer
-            qentry_t *stb_entry = qstb.head;
-            while (stb_entry != NULL) {
-                if (stb_entry->inst->load_store_addr == entry->inst->load_store_addr) {
-                    entry->store_buffer_hit = true;
-                }
-                stb_entry = stb_entry->next;
-            }
-        }
-        /******* Special operations for store ************/
-        if (entry->inst->opcode == OPCODE_STORE) {
-            fifo_insert_tail(&qstb, entry);
-        }
-        /*************************************************/
-        entry = entry->next;
-    }
-    // Calculate the deepest entry's finish cycle
-    int complete_cycle = pipe_length;
-    if (fu->head->inst->dcache_miss) {
-        complete_cycle += L1_MISS_PENALTY;
-    }
-    // Special case for store buffer operations
-    if (fu->head->store_buffer_hit || fu->head->inst->opcode == OPCODE_STORE) {
-        complete_cycle = 1;  // Finishes immediately
-    }
-    // If it's completed pop it and return
-    if (fu->head->exec_cycle >= complete_cycle) {
-        entry = fifo_pop_head(fu);
-        if (entry == NULL) printf("MY ERROR, where did the head go?\n");
-        return entry;
-    }
-    return NULL;
-}
-
-void progress_function_units(queue_t *rs, queue_t *fus, size_t num_fus, size_t pipe_length) {
-    // Allocate entry buffers
-    qentry_t *entry;
-    qentry_t *entry_tmp;
-    // Loop through all FUs
-    for (size_t i = 0; i < num_fus; i++) {
-        queue_t fu = fus[i];
-        // If the function unit is empty, don't need to progress anything
-        if (fu.head == NULL) {
-            continue;
-        }
-        // Progress each entry
-        entry = fu.head;
-        while (entry != NULL) {
-            entry->exec_cycle++;
-            /******** Special operations for load **********/
-            if (entry->inst->opcode == OPCODE_LOAD && entry->exec_cycle == 1) {
-                // Search the store buffer
-                qentry_t *stb_entry = qstb.head;
-                while (stb_entry != NULL) {
-                    if (stb_entry->inst->load_store_addr == entry->inst->load_store_addr) {
-                        entry->store_buffer_hit = true;
-                    }
-                    stb_entry = stb_entry->next;
-                }
-            }
-            /******* Special operations for store ************/
-            if (entry->inst->opcode == OPCODE_STORE) {
-                fifo_insert_tail(&qstb, entry);
-            }
-            /*************************************************/
-            entry = entry->next;
-        }
-        // Calculate the deepest entry's finish cycle
-        int complete_cycle = pipe_length;
-        if (fu.head->inst->dcache_miss) {
-            complete_cycle += L1_MISS_PENALTY;
-        }
-        // Special case for store buffer operations
-        if (fu.head->store_buffer_hit || fu.head->inst->opcode == OPCODE_STORE) {
-            complete_cycle = 1;  // Finishes immediately
-        }
-        // If it's completed remove it and update the ROB entry
-        if (fu.head->exec_cycle >= complete_cycle) {
-            entry = fifo_pop_head(&fu);
-            if (entry == NULL) printf("MY ERROR, where did the head go?\n");
-            // Remove from the RS
-            entry_tmp = fifo_search_and_pop(rs, entry->inst->dyn_instruction_count);
-            if (entry_tmp == NULL) printf("MY ERROR, where did RS entry go?\n");
-            // Copy over to the ROB entry and mark as completed
-            entry_tmp = search_queue(&qrob, entry->inst->dyn_instruction_count);
-            qentry_copy(entry, entry_tmp);
-            entry_tmp->completed = true;  // Mark ROB entry as completed
-        }
-    }
-}
-
 
 
 // The helper functions in this#ifdef are optional and included here for your
@@ -366,7 +241,7 @@ static void print_rat(void) {
 // This will print out the state of the register file, where P0-P31 are architectural registers 
 // and P32 is the first PREG 
 static void print_prf(void) {
-    for (uint64_t regno = 0; /* ??? */ false; regno++) { // TODO: fix me
+    for (uint64_t regno = 0; regno < 32 + NUM_PREGS; regno++) { // TODO: fix me
         if (regno == 0) {
             printf("    { P%03" PRIu64 ": Ready: %d, Free: %d }", regno, reg_file[regno].ready, reg_file[regno].free); // TODO: fix me
         } else if (!(regno & 0x3)) {
@@ -400,6 +275,114 @@ static void print_rob(void) {
 #endif
 
 
+/* Try to fire the instruction from the RS 
+ * Returns 0 on successful fire
+ * Returns -1 on instruction not ready
+ * Returns -2 on no free FUs
+ */
+int try_fire(queue_t *fus, size_t num_fus, qentry_t *entry) {
+#ifdef DEBUG
+    printf("\tAttempting to fire instruction: ");
+    print_instruction(entry->inst);
+    printf("\n");
+#endif
+    // Check if src pregs are ready
+    if (entry->src1_preg < 0 || reg_file[entry->src1_preg].ready) {
+        if (entry->src2_preg < 0 || reg_file[entry->src2_preg].ready) {
+            // Instruction is ready, is there a free FU?
+            queue_t *free_fu = find_free_fu(fus, num_fus);
+            if (free_fu == NULL) {
+                return -2;  // Stop scheduling because all FUs are taken
+            }
+            // Insert a copy into the pipeline
+            qentry_t *fu_entry = fifo_insert_copy_tail(free_fu, entry);
+            fu_entry->exec_cycle = 0;
+#ifdef DEBUG
+            printf("\t\tFired\n");
+#endif
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void progress_function_units(queue_t *rs, queue_t *fus, size_t num_fus, size_t pipe_length) {
+    // Allocate entry buffers
+    qentry_t *entry;
+    qentry_t *entry_tmp;
+    // Loop through all FUs
+    for (size_t i = 0; i < num_fus; i++) {
+        queue_t *fu = &(fus[i]);
+        // If the function unit is empty, don't need to progress anything
+        if (fu->head == NULL) {
+            continue;
+        }
+        // Progress each entry
+        entry = fu->head;
+        while (entry != NULL) {
+            entry->exec_cycle++;
+            /******** Special operations for load **********/
+            if (entry->inst->opcode == OPCODE_LOAD && entry->exec_cycle == 1) {
+                // Search the store buffer
+                qentry_t *stb_entry = qstb.head;
+                while (stb_entry != NULL) {
+                    if (stb_entry->inst->load_store_addr == entry->inst->load_store_addr) {
+                        entry->store_buffer_hit = true;
+                    }
+                    stb_entry = stb_entry->next;
+                }
+            }
+            /******* Special operations for store ************/
+            if (entry->inst->opcode == OPCODE_STORE) {
+                fifo_insert_copy_tail(&qstb, entry);
+            }
+            /*************************************************/
+            entry = entry->next;
+        }
+        // Calculate the deepest entry's finish cycle
+        int complete_cycle = pipe_length;
+        if (fu->head->inst->dcache_miss) {
+            complete_cycle += L1_MISS_PENALTY;
+        }
+        // Special case for store buffer operations
+        if (fu->head->store_buffer_hit || fu->head->inst->opcode == OPCODE_STORE) {
+            complete_cycle = 1;  // Finishes immediately
+        }
+        // If it's completed remove it and update the ROB entry
+        if (fu->head->exec_cycle >= complete_cycle) {
+            int x = 0;
+            if (fu->head->inst->dyn_instruction_count == 26) {
+                x++;
+            }
+            entry = fifo_pop_head(fu);
+            if (entry == NULL) printf("MY ERROR, where did the head go?\n");
+            // Remove from the RS
+            entry_tmp = fifo_search_and_pop(rs, entry->inst->dyn_instruction_count);
+            if (entry_tmp == NULL) {
+                printf("MY ERROR, where did RS entry go?\n");
+            }
+            free(entry_tmp);  // Free the RS entry
+            // Copy over to the ROB entry and mark as completed
+            entry_tmp = search_queue(&qrob, entry->inst->dyn_instruction_count);
+            qentry_copy(entry, entry_tmp);
+            entry_tmp->completed = true;  // Mark ROB entry as completed
+            // Mark preg as ready
+            if (entry->dest_preg >= 0) {
+                reg_file[entry->dest_preg].ready = 1;
+            }
+
+#ifdef DEBUG
+            printf("\tCompleting Instruction: ");
+            print_instruction(entry->inst);
+            printf("\n");
+#endif
+            free(entry);  // Free the FU entry
+        }
+    }
+}
+
+
+
 
 
 // Optional helper function which pops previously retired store buffer entries
@@ -426,6 +409,7 @@ static uint64_t stage_state_update(procsim_stats_t *stats,
     for (int i = 0; i < STORES_COMPLETED; i++) {
         entry = fifo_pop_head(&qstb);
         if (entry == NULL) printf("MY ERROR, why is the store buffer empty?\n");
+        free(entry);
     }
 
     STORES_COMPLETED = 0;  // Reset
@@ -435,18 +419,34 @@ static uint64_t stage_state_update(procsim_stats_t *stats,
         entry = qrob.head;  // Keep getting the ROB head
         if (entry == NULL) break;
         if (entry->completed) {
+            // Store if this instruction was mispredicted
+            bool mispredicted = entry->inst->mispredict;
             // Free previous preg if it's not an architectural register
             if (entry->prev_preg >= 32) reg_file[entry->prev_preg].free = true;
-            // Set preg to ready
-            reg_file[entry->dest_preg].ready = true;
             // Increment counters
             if (entry->inst->opcode == OPCODE_STORE) STORES_COMPLETED++;
             completed++;
             // Remove from the ROB
             entry = fifo_pop_head(&qrob);
             if (entry == NULL) printf("MY ERROR, why isn't it in the ROB?\n");
-            // Stop if this instruction was mispredicted
-            if (entry->inst->mispredict) {
+            // Update read statistics
+            if (entry->inst->opcode == OPCODE_LOAD) {
+                stats->reads++;
+                if (entry->store_buffer_hit) {
+                    stats->store_buffer_read_hits++;
+                } else {
+                    stats->dcache_reads++;
+                    if (entry->inst->dcache_miss) {
+                        stats->dcache_read_misses++;
+                    } else {
+                        stats->dcache_read_hits++;
+                    }
+                }
+            }
+            // Free the ROB entry
+            free(entry);
+            // Stop if this instruction was mispredicted and set sim flag
+            if (mispredicted) {
                 *retired_mispredict_out = true;
                 break;
             }
@@ -455,6 +455,7 @@ static uint64_t stage_state_update(procsim_stats_t *stats,
         }
     }
 
+    stats->instructions_retired += completed;
     return completed;
 }
 
@@ -468,70 +469,24 @@ static void stage_exec(procsim_stats_t *stats) {
 #ifdef DEBUG
     printf("Stage Exec: \n"); //  PROVIDED
 #endif
-    qentry_t *entry;
-    qentry_t *entry_tmp;
-
-    // Progress ALUs
-    for (size_t i = 0; i < NUM_ALU_FUS; i++) {
-        entry = progress_function_unit(&(qalu_fus[i]), 1);
-        if (entry != NULL) {
-            // Remove from the RS
-            entry_tmp = fifo_search_and_pop(&qalu_rs, entry->inst->dyn_instruction_count);
-            if (entry_tmp == NULL) printf("MY ERROR, where did RS entry go?\n");
-            // Copy over to the ROB entry and mark as completed
-            entry_tmp = search_queue(&qrob, entry->inst->dyn_instruction_count);
-            qentry_copy(entry, entry_tmp);
-            entry_tmp->completed = true;  // Mark ROB entry as completed
-        }
-    }
 
 #ifdef DEBUG
     printf("Progressing ALU units\n");  // PROVIDED
 #endif
 
-    // Progress MULs
-    for (size_t i = 0; i < NUM_MUL_FUS; i++) {
-        entry = progress_function_unit(&(qmul_fus[i]), 3);
-        if (entry != NULL) {
-            // Remove from the RS
-            entry_tmp = fifo_search_and_pop(&qmul_rs, entry->inst->dyn_instruction_count);
-            if (entry_tmp == NULL) printf("MY ERROR, where did RS entry go?\n");
-            // Copy over to the ROB entry and mark as completed
-            entry_tmp = search_queue(&qrob, entry->inst->dyn_instruction_count);
-            qentry_copy(entry, entry_tmp);
-            entry_tmp->completed = true;  // Mark ROB entry as completed
-        }
-    }
+    progress_function_units(&qalu_rs, qalu_fus, NUM_ALU_FUS, 1);
 
 #ifdef DEBUG
     printf("Progressing MUL units\n");  // PROVIDED
 #endif
 
-    // Progress Load/Stores
-    for (size_t i = 0; i < NUM_LSU_FUS; i++) {
-        entry = progress_function_unit(&(qlsu_fus[i]), 2);
-        if (entry != NULL) {
-            // Remove from the RS
-            entry_tmp = fifo_search_and_pop(&qlsu_rs, entry->inst->dyn_instruction_count);
-            if (entry_tmp == NULL) printf("MY ERROR, where did RS entry go?\n");
-            // Copy over to the ROB entry and mark as completed
-            entry_tmp = search_queue(&qrob, entry->inst->dyn_instruction_count);
-            qentry_copy(entry, entry_tmp);
-            entry_tmp->completed = true;  // Mark ROB entry as completed
-        }
-    }
+    progress_function_units(&qmul_rs, qmul_fus, NUM_MUL_FUS, 3);
 
 #ifdef DEBUG
-    printf("Progressing LSU units for loads\n");  // PROVIDED
+    printf("Progressing LSU units for loads and stores and processing result busses\n");  // PROVIDED
 #endif
 
-#ifdef DEBUG
-    printf("Progressing LSU units for stores\n");  // PROVIDED
-#endif
-
-#ifdef DEBUG
-    printf("Processing Result Busses\n"); // PROVIDED
-#endif
+    progress_function_units(&qlsu_rs, qlsu_fus, NUM_LSU_FUS, L1_HIT_TIME);
 }
 
 // Optional helper function which is responsible for looking through the
@@ -544,15 +499,22 @@ static void stage_exec(procsim_stats_t *stats) {
 // they complete (at which point stage_exec() above should free their RS).
 static void stage_schedule(procsim_stats_t *stats) {
     // TODO: fill me in
+#ifdef DEBUG
+    printf("Stage Schedule: \n"); //  PROVIDED
+#endif
     qentry_t *entry;
     int success;
 
     // Schedule from ALU RS
     entry = qalu_rs.head;
     while (entry != NULL) {
-        success = try_fire(qalu_fus, NUM_ALU_FUS, entry);
-        if (success == -2) {
-            break;  // Stop scheduling because all FUs are taken
+        if (!entry->fired) {
+            success = try_fire(qalu_fus, NUM_ALU_FUS, entry);
+            if (success == 0) {
+                entry->fired = true;
+            } else if (success == -2) {
+                break;  // Stop scheduling because all FUs are taken
+            }
         }
         entry = entry->next;
     }
@@ -560,9 +522,13 @@ static void stage_schedule(procsim_stats_t *stats) {
     // Schedule from MUL RS
     entry = qmul_rs.head;
     while (entry != NULL) {
-        success = try_fire(qmul_fus, NUM_MUL_FUS, entry);
-        if (success == -2) {
-            break;  // Stop scheduling because all FUs are taken
+        if (!entry->fired) {
+            success = try_fire(qmul_fus, NUM_MUL_FUS, entry);
+            if (success == 0) {
+                entry->fired = true;
+            } else if (success == -2) {
+                break;  // Stop scheduling because all FUs are taken
+            }
         }
         entry = entry->next;
     }
@@ -570,39 +536,43 @@ static void stage_schedule(procsim_stats_t *stats) {
     // Schedule from LS RS
     entry = qlsu_rs.head;
     while (entry != NULL) {
-        /************* Memory Disambiguation Logic *************/
-        int ok_to_fire = true;
-        if (entry->inst->opcode == OPCODE_LOAD) {
-            qentry_t *preceding_op_entry = qlsu_rs.head;
-            // Check from the start of the RS Queue up to this instruction
-            // if there are any stores
-            while (preceding_op_entry != entry) {
-                if (preceding_op_entry->inst->opcode == OPCODE_STORE) {
-                    ok_to_fire = false;
-                    break;
+        if (!entry->fired) {
+            /************* Memory Disambiguation Logic *************/
+            int ok_to_fire = true;
+            if (entry->inst->opcode == OPCODE_LOAD) {
+                qentry_t *preceding_op_entry = qlsu_rs.head;
+                // Check from the start of the RS Queue up to this instruction
+                // if there are any stores
+                while (preceding_op_entry != entry) {
+                    if (preceding_op_entry->inst->opcode == OPCODE_STORE
+                            && !preceding_op_entry->completed) {
+                        ok_to_fire = false;
+                        break;
+                    }
+                    preceding_op_entry = preceding_op_entry->next;
                 }
-                preceding_op_entry = preceding_op_entry->next;
+            } else {
+                // A store can only occur if it's at the head of the LSU RS
+                if (entry != qlsu_rs.head) {
+                    ok_to_fire = false;
+                }
             }
-        } else {
-            // A store can only occur if it's at the head of the LSU RS
-            if (entry != qlsu_rs.head) {
-                ok_to_fire = false;
+            if (!ok_to_fire) {
+#ifdef DEBUG
+                printf("\tUnable to fire to LSU due to disambiguation\n");
+                break;
+#endif
             }
-        }
-        if (!ok_to_fire) {
-            break;
-        }
-        /*******************************************************/
-        success = try_fire(qlsu_fus, NUM_LSU_FUS, entry);
-        if (success == -2) {
-            break;  // Stop scheduling because all FUs are taken
+            /*******************************************************/
+            success = try_fire(qlsu_fus, NUM_LSU_FUS, entry);
+            if (success == 0) {
+                entry->fired = true;
+            } else if (success == -2) {
+                break;  // Stop scheduling because all FUs are taken
+            }
         }
         entry = entry->next;
     }
-
-#ifdef DEBUG
-    printf("Stage Schedule: \n"); //  PROVIDED
-#endif
 }
 
 // Optional helper function which looks through the dispatch queue, decodes
@@ -616,8 +586,23 @@ static void stage_schedule(procsim_stats_t *stats) {
 // The PDF has details.
 static void stage_dispatch(procsim_stats_t *stats) {
     // TODO: fill me in
+#ifdef DEBUG
+    printf("Stage Dispatch: \n"); //  PROVIDED
+#endif
     qentry_t *entry = qdis.head;  // Start at dispatch queue head
-    while (entry != NULL) {
+    if (stats->cycles == 33) {
+        int x = 0; x++;
+    }
+    while (1) {
+        entry = qdis.head;  // Keep getting dispatch head
+        if (entry == NULL) {
+            break;
+        }
+#ifdef DEBUG
+        printf("\tAttempting Dispatch for: ");
+        print_instruction(entry->inst);
+        printf("\n");
+#endif
 
         // Don't commit any changes to queues until all conditions satisfied
 
@@ -717,20 +702,22 @@ static void stage_dispatch(procsim_stats_t *stats) {
             printf("MY ERROR, why was the ROB full?\n");
             return;
         }
-
-        entry = entry->next;
-    }
-
 #ifdef DEBUG
-    printf("Stage Dispatch: \n"); //  PROVIDED
+        printf("\t\tDispatching instruction\n");
 #endif
+    }
 }
 
+bool prev_in_icached_miss = false;
+extern bool in_icache_miss;
 // Optional helper function which fetches instructions from the instruction
 // cache using the provided procsim_driver_read_inst() function implemented
 // in the driver and appends them to the dispatch queue. To simplify the
 // project, the dispatch queue is infinite in size.
 static void stage_fetch(procsim_stats_t *stats) {
+#ifdef DEBUG
+    printf("Stage Fetch: \n"); //  PROVIDED
+#endif
     // Fetch instructions and add them to the dispatch queue
     for (size_t i = 0; i < FETCH_WIDTH; i++) {
         const inst_t *inst = procsim_driver_read_inst();
@@ -741,10 +728,17 @@ static void stage_fetch(procsim_stats_t *stats) {
         if (success != 0) {
             printf("MY ERROR, why couldn't we add to the dispatch queue?\n");
         }
-    }
 #ifdef DEBUG
-    printf("Stage Fetch: \n"); //  PROVIDED
+        printf("Fetched Instruction: ");
+        print_instruction(entry->inst);
+        printf("\n");
 #endif
+        stats->instructions_fetched++;
+    }
+    if (!prev_in_icached_miss && in_icache_miss) {
+        stats->icache_misses++;
+    }
+    prev_in_icached_miss = in_icache_miss;
 }
 
 // Use this function to initialize all your data structures, simulator
@@ -785,9 +779,13 @@ void procsim_init(const procsim_conf_t *sim_conf, procsim_stats_t *stats) {
 
     // Initialize the register file
     reg_file = (reg_t *)malloc(sizeof(reg_t) * (32 + sim_conf->num_pregs));
-    for (uint32_t i = 0; i < 32 + sim_conf->num_pregs; i++) {
-        reg_file[i].free = 1;
+    for (uint32_t i = 0; i < 32; i++) {
+        reg_file[i].free = 0;
         reg_file[i].ready = 1;
+    }
+    for (uint32_t i = 32; i < 32 + sim_conf->num_pregs; i++) {
+        reg_file[i].free = 1;
+        reg_file[i].ready = 0;
     }
 
     // Initialize RAT with respective architectural reg number
@@ -855,6 +853,19 @@ uint64_t procsim_do_cycle(procsim_stats_t *stats,
 
     // TODO: Increment max_usages and avg_usages in stats here!
     stats->cycles++;
+    if (qdis.size >= stats->dispq_max_size) {
+        stats->dispq_max_size = qdis.size;
+    }
+    uint64_t schedq_size = qalu_rs.size + qmul_rs.size + qlsu_rs.size;
+    if (schedq_size >= stats->schedq_max_size) {
+        stats->schedq_max_size = schedq_size;
+    }
+    if (qrob.size >= stats->rob_max_size) {
+        stats->rob_max_size = qrob.size;
+    }
+    stats->dispq_avg_size += qdis.size;
+    stats->schedq_avg_size += schedq_size;
+    stats->rob_avg_size += qrob.size;
 
     // Return the number of instructions we retired this cycle (including the
     // interrupt we retired, if there was one!)
@@ -865,4 +876,29 @@ uint64_t procsim_do_cycle(procsim_stats_t *stats,
 // calculate some final statistics.
 void procsim_finish(procsim_stats_t *stats) {
     // TODO: fill me in
+    stats->dispq_avg_size = (double)stats->dispq_avg_size / stats->cycles;
+
+    stats->schedq_avg_size = (double)stats->schedq_avg_size / stats->cycles;
+
+    stats->rob_avg_size = (double)stats->rob_avg_size / stats->cycles;
+
+    stats->store_buffer_hit_ratio = (double)stats->store_buffer_read_hits /
+        stats->reads;
+
+    stats->dcache_read_miss_ratio = (double)stats->dcache_read_misses /
+        stats->dcache_reads;
+
+    stats->dcache_ratio = (double)stats->dcache_reads / stats->reads;
+
+    stats->dcache_read_aat = L1_HIT_TIME + stats->dcache_read_miss_ratio * L1_MISS_PENALTY;
+
+    stats->read_aat = stats->store_buffer_hit_ratio * 1 +
+        stats->dcache_ratio * stats->dcache_read_aat;
+
+    stats->ipc = (double)stats->instructions_retired / stats->cycles;
+
+    free(reg_file);
+    free(qalu_fus);
+    free(qmul_fus);
+    free(qlsu_fus);
 }
