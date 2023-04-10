@@ -48,6 +48,7 @@ queue_t *qmul_fus;  // List of MUL FU pipes
 size_t NUM_MUL_FUS;
 queue_t *qlsu_fus;  // List of LSU FU pipes
 size_t NUM_LSU_FUS;
+bool in_mispredict = false;
 
 typedef struct reg {
     bool free;
@@ -435,6 +436,7 @@ static uint64_t stage_state_update(procsim_stats_t *stats,
             // Stop if this instruction was mispredicted and set sim flag
             if (mispredicted) {
                 *retired_mispredict_out = true;
+                in_mispredict = false;
                 break;
             }
         } else {
@@ -492,6 +494,7 @@ static void stage_schedule(procsim_stats_t *stats) {
     qentry_t *entry;
     int success;
     int ok_to_fire;
+    int fired_this_cycle = false;
     qentry_t *preceding_op_entry;
 
     // Schedule
@@ -539,9 +542,13 @@ static void stage_schedule(procsim_stats_t *stats) {
             }
             if (success == 0) {
                 entry->fired = true;
+                fired_this_cycle = true;
             }
         }
         entry = entry->next;
+    }
+    if (!fired_this_cycle) {
+        stats->no_fire_cycles++;
     }
 }
 
@@ -580,6 +587,7 @@ static void stage_dispatch(procsim_stats_t *stats) {
 
         // Check if the ROB has room
         if (qrob.size >= qrob.max_size) {
+            stats->rob_stall_cycles++;
             return;
         }
 
@@ -592,7 +600,10 @@ static void stage_dispatch(procsim_stats_t *stats) {
                     break;
                 }
             }
-            if (dest_preg_num < 0) return;  // No free pregs
+            if (dest_preg_num < 0) {
+                stats->no_dispatch_pregs_cycles++;
+                return;  // No free pregs
+            }
         }
 
         // Now queue changes will be committed
@@ -646,8 +657,7 @@ static void stage_dispatch(procsim_stats_t *stats) {
     }
 }
 
-bool prev_in_icached_miss = false;
-extern bool in_icache_miss;
+bool in_icache_miss_local = false;
 // Optional helper function which fetches instructions from the instruction
 // cache using the provided procsim_driver_read_inst() function implemented
 // in the driver and appends them to the dispatch queue. To simplify the
@@ -659,12 +669,25 @@ static void stage_fetch(procsim_stats_t *stats) {
     // Fetch instructions and add them to the dispatch queue
     for (size_t i = 0; i < FETCH_WIDTH; i++) {
         const inst_t *inst = procsim_driver_read_inst();
-        if (inst == NULL) return;
+        if (inst == NULL) {
+            if (!in_mispredict) {
+                in_icache_miss_local = true;
+            }
+            return;
+        }
+        // New instruction fetched
+        if (in_icache_miss_local) {
+            stats->icache_misses++;
+            in_icache_miss_local = false;
+        }
         qentry_t *entry = (qentry_t *)calloc(1, sizeof(qentry_t));
         entry->inst = inst;
         int success = fifo_insert_tail(&qdisp, entry);
         if (success != 0) {
             printf("MY ERROR, why couldn't we add to the dispatch queue?\n");
+        }
+        if (inst->mispredict) {
+            in_mispredict = true;
         }
 #ifdef DEBUG
         printf("Fetched Instruction: ");
@@ -673,10 +696,6 @@ static void stage_fetch(procsim_stats_t *stats) {
 #endif
         stats->instructions_fetched++;
     }
-    if (!prev_in_icached_miss && in_icache_miss) {
-        stats->icache_misses++;
-    }
-    prev_in_icached_miss = in_icache_miss;
 }
 
 // Use this function to initialize all your data structures, simulator
