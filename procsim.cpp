@@ -166,8 +166,10 @@ qentry_t *fifo_search_and_pop(queue_t *q, uint64_t dyn_instruction_count) {
  */
 queue_t *find_free_fu(queue_t *fus, size_t num_fus) {
     for (size_t i = 0; i < num_fus; i++) {
-        if (fus[i].size >= fus[i].max_size) continue;
-        if (fus[i].tail == NULL || fus[i].tail->exec_cycle >= 0) {
+        if (fus[i].size >= fus[i].max_size) {
+            continue;
+        }
+        if (fus[i].tail == NULL || fus[i].tail->exec_cycle >= 1) {
             return &(fus[i]);
         }
     }
