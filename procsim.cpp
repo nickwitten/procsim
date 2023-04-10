@@ -593,6 +593,11 @@ static void stage_dispatch(procsim_stats_t *stats) {
             return;
         }
 
+        // Check if the schedule queue has room
+        if (qsched.size >= qsched.max_size) {
+            return;
+        }
+
         // Search for a free preg
         int dest_preg_num = -1;
         if (inst->dest >= 0) {
@@ -610,15 +615,9 @@ static void stage_dispatch(procsim_stats_t *stats) {
 
         // Now queue changes will be committed
 
-        // Add to schedule queue
-        int success = -1;
-        if (qsched.size < qsched.max_size) {
-            success = fifo_insert_tail(&qsched, fifo_pop_head(&qdisp));
-            if (success != 0) {
-                printf("MY ERROR, why was the schedule queue full?\n");
-                return;
-            }
-        } else {
+        int success = fifo_insert_tail(&qsched, fifo_pop_head(&qdisp));
+        if (success != 0) {
+            printf("MY ERROR, why was the schedule queue full?\n");
             return;
         }
 
